@@ -508,29 +508,39 @@ async function createProviderCompletion(
   );
 }
 
-function processLatexToImg(text, isSvg) {
-  text = String(text || "");
+function makeLatexImg(mathCode, isSvg, type) {
   const fmt = isSvg ? "svg" : "gif";
   const prefix = String.raw`\dpi{110}\bg_white\space `;
-
-  text = text.replace(/\\\[([\s\S]*?)\\\]/g, (_, math) => {
-    const mathCode = math.trim();
-    const src = `https://latex.codecogs.com/${fmt}.image?${encodeURIComponent(
-      prefix + mathCode
-    )}`;
+  const src = `https://latex.codecogs.com/${fmt}.image?${encodeURIComponent(
+    prefix + mathCode
+  )}`;
+  if (type === "block") {
     return `<br><img src="${src}" style="max-width:100%; border:none;" alt="Math block"><br>`;
-  });
-
-  text = text.replace(/\\\(([\s\S]*?)\\\)/g, (_, math) => {
-    const mathCode = math.trim();
-    const src = `https://latex.codecogs.com/${fmt}.image?${encodeURIComponent(
-      prefix + mathCode
-    )}`;
-    return `<img src="${src}" style="vertical-align: middle; max-width:100%; border:none;" alt="Math inline">`;
-  });
-
-  return text;
+  }
+  return `<img src="${src}" style="vertical-align: middle; max-width:100%; border:none;" alt="Math inline">`;
 }
+function processLatexToPlaceholders(text, isSvg) {
+  const placeholders = [];
+  const placeholderBase = "%%LATEX_PLACEHOLDER_";
+  text = String(text || "").replace(/\\\[([\s\S]*?)\\\]/g, (_, math) => {
+    const index = placeholders.length;
+    placeholders.push(makeLatexImg(math.trim(), isSvg, "block"));
+    return `${placeholderBase}${index}%%`;
+  });
+  text = text.replace(/\\\(([\s\S]*?)\\\)/g, (_, math) => {
+    const index = placeholders.length;
+    placeholders.push(makeLatexImg(math.trim(), isSvg, "inline"));
+    return `${placeholderBase}${index}%%`;
+  });
+  return { text, placeholders };
+}
+function restoreLatexPlaceholders(html, placeholders) {
+  placeholders.forEach((imgTag, index) => {
+    html = html.replace(`${"%%LATEX_PLACEHOLDER_"}${index}%%`, imgTag);
+  });
+  return html;
+}
+
 
 function renderHtml(state, providers) {
   const currentSelection = state.last_selection;
@@ -747,12 +757,15 @@ export default {
             );
 
             const clientSupportsSvg = getCookie(request, "svg_supported") === "1";
-            const botProcessed = processLatexToImg(apiResult.text, clientSupportsSvg);
-            const botHtml = await marked.parse(botProcessed);
-
+            const { text: textWithPlaceholders, placeholders } = processLatexToPlaceholders(
+              apiResult.text,
+              clientSupportsSvg
+            );
+            const botHtml = await marked.parse(textWithPlaceholders);
+            const botHtmlFinal = restoreLatexPlaceholders(botHtml, placeholders);
             state.messages.push({
               role: "assistant",
-              content: botHtml,
+              content: botHtmlFinal,
               raw_content: apiResult.text,
               usage: apiResult.usage,
             });
