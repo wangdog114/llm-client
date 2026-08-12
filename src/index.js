@@ -205,14 +205,36 @@ async function createOpenAICompletion(
     providerInfo.base_url || providerInfo.baseUrl || "https://api.openai.com/v1"
   ).replace(/\/+$/, "");
 
-  const messages = [{ role: "system", content: systemPrompt }];
+  const webSearchEnabled =
+    modelInfo?.web_search ??
+    modelInfo?.webSearch ??
+    providerInfo.web_search ??
+    providerInfo.webSearch ??
+    false;
 
+  const input = [];
   for (const m of chatHistory) {
-    messages.push({ role: m.role, content: m.raw_content || m.content });
+    if (m.role === "user" || m.role === "assistant") {
+      input.push({
+        role: m.role,
+        content: m.raw_content || m.content,
+      });
+    }
   }
-  messages.push({ role: "user", content: userText });
+  input.push({ role: "user", content: userText });
 
-  const body = { model: modelName, messages };
+  const body = {
+    model: modelName,
+    input,
+  };
+
+  if (systemPrompt) {
+    body.instructions = systemPrompt;
+  }
+
+  if (webSearchEnabled) {
+    body.tools = [{ type: "web_search" }];
+  }
 
   const reasoningEffort = getReasoningEffort(
     providerInfo,
@@ -220,10 +242,10 @@ async function createOpenAICompletion(
     reasoningLevel
   );
   if (reasoningEffort != null && reasoningEffort !== "") {
-    body.reasoning_effort = reasoningEffort;
+    body.reasoning = { effort: reasoningEffort };
   }
 
-  const resp = await fetch(`${baseUrl}/chat/completions`, {
+  const resp = await fetch(`${baseUrl}/responses`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -240,22 +262,31 @@ async function createOpenAICompletion(
   }
 
   const data = JSON.parse(responseText);
-  const text = data.choices?.[0]?.message?.content || "";
 
-  const promptTokens = data.usage?.prompt_tokens || 0;
-  const reasoningTokens =
-    data.usage?.completion_tokens_details?.reasoning_tokens || 0;
-  const completionTokens = (data.usage?.completion_tokens || 0) + reasoningTokens;
+  const output = data.output || [];
+  let finalText = "";
+  for (let i = output.length - 1; i >= 0; i--) {
+    const item = output[i];
+    if (item.type === "message") {
+      const textParts = (item.content || [])
+        .filter((c) => c.type === "output_text")
+        .map((c) => c.text || "");
+      if (textParts.length > 0) {
+        finalText = textParts.join("");
+        break;
+      }
+    }
+  }
 
   const usage = data.usage
     ? {
-      prompt: promptTokens,
-      completion: completionTokens,
-      total: promptTokens + completionTokens,
+      prompt: data.usage.input_tokens || 0,
+      completion: data.usage.output_tokens || 0,
+      total: data.usage.total_tokens || 0,
     }
     : null;
 
-  return { text, usage };
+  return { text: finalText, usage };
 }
 
 async function createAnthropicCompletion(
@@ -387,7 +418,7 @@ async function createGoogleGroundedCompletion(
   };
 
   if (googleSearchEnabled) {
-    body.tools = [{ google_search: {} }];
+    body.tools = [{ google_search: {}, url_context: {} }];
   }
 
   if (supportsThinking) {
