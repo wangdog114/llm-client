@@ -206,7 +206,7 @@ function buildGoogleContents(chatHistory, userText) {
   return contents;
 }
 
-async function createOpenAICompletion(
+async function createOpenAIResponsesCompletion(
   providerInfo,
   modelInfo,
   modelName,
@@ -280,7 +280,7 @@ async function createOpenAICompletion(
 
   const responseText = await resp.text();
   if (!resp.ok) {
-    throw new Error(`OpenAI API error ${resp.status}: ${responseText}`);
+    throw new Error(`OpenAI Responses API error ${resp.status}: ${responseText}`);
   }
 
   const data = JSON.parse(responseText);
@@ -309,6 +309,121 @@ async function createOpenAICompletion(
     : null;
 
   return { text: finalText, usage };
+}
+
+async function createOpenAICompletionsCompletion(
+  providerInfo,
+  modelInfo,
+  modelName,
+  systemPrompt,
+  chatHistory,
+  userText,
+  reasoningLevel
+) {
+  const apiKey =
+    modelInfo?.api_key ||
+    modelInfo?.apiKey ||
+    providerInfo.api_key ||
+    providerInfo.apiKey;
+
+  if (!apiKey) throw new Error("No API key for OpenAI-compatible provider.");
+
+  const baseUrl = String(
+    providerInfo.base_url || providerInfo.baseUrl || "https://api.openai.com/v1"
+  ).replace(/\/+$/, "");
+
+  const messages = [];
+
+  if (systemPrompt) {
+    messages.push({
+      role: "developer",
+      content: systemPrompt,
+    });
+  }
+
+  for (const m of chatHistory) {
+    if (m.role === "user" || m.role === "assistant") {
+      messages.push({ role: m.role, content: m.raw_content || m.content });
+    }
+  }
+  messages.push({ role: "user", content: userText });
+
+  const body = {
+    model: modelName,
+    messages,
+  };
+
+  const reasoningEffort = getReasoningEffort(
+    providerInfo,
+    modelName,
+    reasoningLevel
+  );
+  if (reasoningEffort != null && reasoningEffort !== "") {
+    body.reasoning = { effort: reasoningEffort };
+  }
+
+  const resp = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    },
+    body: JSON.stringify(body),
+  });
+
+  const responseText = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`OpenAI Chat Completions API error ${resp.status}: ${responseText}`);
+  }
+
+  const data = JSON.parse(responseText);
+  const text = data.choices?.[0]?.message?.content || "";
+
+  const usage = data.usage
+    ? {
+      prompt: data.usage.prompt_tokens || 0,
+      completion: data.usage.completion_tokens || 0,
+      total: data.usage.total_tokens || 0,
+    }
+    : null;
+
+  return { text, usage };
+}
+
+async function createOpenAICompletion(
+  providerInfo,
+  modelInfo,
+  modelName,
+  systemPrompt,
+  chatHistory,
+  userText,
+  reasoningLevel
+) {
+  const apiType = modelInfo?.api_type || modelInfo?.apiType || "responses";
+
+  if (apiType === "completions" || apiType === "chat") {
+    return createOpenAICompletionsCompletion(
+      providerInfo,
+      modelInfo,
+      modelName,
+      systemPrompt,
+      chatHistory,
+      userText,
+      reasoningLevel
+    );
+  }
+
+  return createOpenAIResponsesCompletion(
+    providerInfo,
+    modelInfo,
+    modelName,
+    systemPrompt,
+    chatHistory,
+    userText,
+    reasoningLevel
+  );
 }
 
 async function createAnthropicCompletion(
