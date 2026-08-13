@@ -13,18 +13,33 @@ const REASONING_LEVELS = [
   { value: "3", label: "高" },
 ];
 
-let ensureTablePromise = null;
+async function withRetry(fn, retries = 3, delayMs = 500) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isD1Error = err.message && err.message.includes("D1_ERROR");
+      if (isD1Error && i < retries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * Math.pow(2, i)));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
-function ensureTable(env) {
+let ensureTablePromise = null;
+async function ensureTable(env) {
   if (!ensureTablePromise) {
-    ensureTablePromise = env.DB.prepare(
-      `CREATE TABLE IF NOT EXISTS sessions (
-        id TEXT PRIMARY KEY,
-        data TEXT NOT NULL,
-        expires_at INTEGER NOT NULL
-      )`
+    ensureTablePromise = withRetry(() =>
+      env.DB.prepare(
+        `CREATE TABLE IF NOT EXISTS sessions (
+          id TEXT PRIMARY KEY,
+          data TEXT NOT NULL,
+          expires_at INTEGER NOT NULL
+        )`
+      ).run()
     )
-      .run()
       .then(() => true)
       .catch((err) => {
         ensureTablePromise = null;
@@ -84,25 +99,32 @@ function setSessionCookie(id) {
   )}`;
 }
 
-async function saveSession(env, id, state) {
-  await ensureTable(env);
-  await env.DB.prepare(
-    `INSERT INTO sessions (id, data, expires_at)
-     VALUES (?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`
-  )
-    .bind(id, JSON.stringify(state), Date.now() + SESSION_TTL_MS)
-    .run();
-}
-
 async function loadSession(env, id) {
   await ensureTable(env);
-  const row = await env.DB.prepare(
-    `SELECT data FROM sessions WHERE id = ? AND expires_at > ?`
-  )
-    .bind(id, Date.now())
-    .first();
+  const row = await withRetry(() =>
+    env.DB.prepare(
+      `SELECT data FROM sessions WHERE id = ? AND expires_at > ?`
+    )
+      .bind(id, Date.now())
+      .first()
+  );
   return row ? normalizeState(JSON.parse(row.data), env) : null;
+}
+async function saveSession(env, id, state) {
+  await ensureTable(env);
+  const MAX_MESSAGES = 100;
+  if (state.messages.length > MAX_MESSAGES) {
+    state.messages = state.messages.slice(-MAX_MESSAGES);
+  }
+  await withRetry(() =>
+    env.DB.prepare(
+      `INSERT INTO sessions (id, data, expires_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET data = excluded.data, expires_at = excluded.expires_at`
+    )
+      .bind(id, JSON.stringify(state), Date.now() + SESSION_TTL_MS)
+      .run()
+  );
 }
 
 async function loadOrCreateSession(env, id) {
