@@ -28,6 +28,47 @@ async function withRetry(fn, retries = 3, delayMs = 500) {
   }
 }
 
+async function consumeSseStream(body, onData) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let newlineIndex;
+    while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+      let line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
+      buffer = buffer.slice(newlineIndex + 1);
+
+      if (!line || line.startsWith(":")) continue;
+      if (!line.startsWith("data:")) continue;
+
+      const data = line.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+
+      try {
+        onData(JSON.parse(data));
+      } catch (_) {
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    const line = buffer.replace(/\r$/, "");
+    if (line.startsWith("data:")) {
+      const data = line.slice(5).trim();
+      if (data && data !== "[DONE]") {
+        try {
+          onData(JSON.parse(data));
+        } catch (_) { }
+      }
+    }
+  }
+}
+
 let ensureTablePromise = null;
 async function ensureTable(env) {
   if (!ensureTablePromise) {
@@ -267,46 +308,36 @@ async function createOpenAIResponsesCompletion(
     body.reasoning = { effort: reasoningEffort };
   }
 
+  body.stream = true;
+
   const resp = await fetch(`${baseUrl}/responses`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify(body),
   });
 
-  const responseText = await resp.text();
   if (!resp.ok) {
-    throw new Error(`OpenAI Responses API error ${resp.status}: ${responseText}`);
+    const errorText = await resp.text();
+    throw new Error(`OpenAI Responses API error ${resp.status}: ${errorText}`);
   }
 
-  const data = JSON.parse(responseText);
-
-  const output = data.output || [];
   let finalText = "";
-  for (let i = output.length - 1; i >= 0; i--) {
-    const item = output[i];
-    if (item.type === "message") {
-      const textParts = (item.content || [])
-        .filter((c) => c.type === "output_text")
-        .map((c) => c.text || "");
-      if (textParts.length > 0) {
-        finalText = textParts.join("");
-        break;
-      }
-    }
-  }
+  let usage = null;
 
-  const usage = data.usage
-    ? {
-      prompt: data.usage.input_tokens || 0,
-      completion: data.usage.output_tokens || 0,
-      total: data.usage.total_tokens || 0,
+  await consumeSseStream(resp.body, (json) => {
+    if (json.type === "response.output_text.delta") {
+      finalText += json.delta || "";
     }
-    : null;
+
+    if (json.type === "response.completed" && json.response?.usage) {
+      const u = json.response.usage;
+      usage = {
+        prompt: u.input_tokens || 0,
+        completion: u.output_tokens || 0, // 官方已包含 reasoning tokens
+        total: u.total_tokens || 0,
+      };
+    }
+  });
 
   return { text: finalText, usage };
 }
@@ -362,34 +393,40 @@ async function createOpenAICompletionsCompletion(
     body.reasoning = { effort: reasoningEffort };
   }
 
+  body.stream = true;
+
   const resp = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    },
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify(body),
   });
 
-  const responseText = await resp.text();
   if (!resp.ok) {
-    throw new Error(`OpenAI Chat Completions API error ${resp.status}: ${responseText}`);
+    const errorText = await resp.text();
+    throw new Error(`OpenAI Chat Completions API error ${resp.status}: ${errorText}`);
   }
 
-  const data = JSON.parse(responseText);
-  const text = data.choices?.[0]?.message?.content || "";
+  let finalText = "";
+  let usage = null;
 
-  const usage = data.usage
-    ? {
-      prompt: data.usage.prompt_tokens || 0,
-      completion: data.usage.completion_tokens || 0,
-      total: data.usage.total_tokens || 0,
+  await consumeSseStream(resp.body, (json) => {
+    if (json.usage) {
+      const reasoning = json.usage.completion_tokens_details?.reasoning_tokens || 0;
+      const completion = (json.usage.completion_tokens || 0) + reasoning;
+      usage = {
+        prompt: json.usage.prompt_tokens || 0,
+        completion,
+        total: json.usage.total_tokens || 0,
+      };
     }
-    : null;
 
-  return { text, usage };
+    const delta = json.choices?.[0]?.delta;
+    if (delta && typeof delta.content === "string") {
+      finalText += delta.content;
+    }
+  });
+
+  return { text: finalText, usage };
 }
 
 async function createOpenAICompletion(
@@ -482,42 +519,48 @@ async function createAnthropicCompletion(
     body.output_config = { effort: reasoningEffort };
   }
 
+  body.stream = true;
+
   const resp = await fetch(`${baseUrl}/v1/messages`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-api-key": apiKey,
-      "anthropic-version":
-        providerInfo.anthropic_version || env?.ANTHROPIC_VERSION || "2023-06-01",
+      "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify(body),
   });
 
-  const responseText = await resp.text();
   if (!resp.ok) {
-    throw new Error(`Anthropic API error ${resp.status}: ${responseText}`);
+    const errorText = await resp.text();
+    throw new Error(`Anthropic API error ${resp.status}: ${errorText}`);
   }
 
-  const data = JSON.parse(responseText);
+  let finalText = "";
+  let usage = null;
 
-  const text = (data.content || [])
-    .filter((block) => block.type === "text")
-    .map((block) => block.text || "")
-    .join("");
-
-  const promptTokens = data.usage?.input_tokens || 0;
-  const thinkingTokens = data.usage?.output_tokens_details?.thinking_tokens || 0;
-  const completionTokens = (data.usage?.output_tokens || 0) + thinkingTokens;
-
-  const usage = data.usage
-    ? {
-      prompt: promptTokens,
-      completion: completionTokens,
-      total: promptTokens + completionTokens,
+  await consumeSseStream(resp.body, (json) => {
+    if (json.type === "message_start") {
+      usage = {
+        prompt: json.message?.usage?.input_tokens || 0,
+        completion: 0,
+        total: 0,
+      };
     }
-    : null;
 
-  return { text, usage };
+    if (json.type === "content_block_delta") {
+      if (json.delta?.type === "text_delta") {
+        finalText += json.delta.text || "";
+      }
+    }
+
+    if (json.type === "message_delta" && usage) {
+      usage.completion = json.usage?.output_tokens || 0;
+      usage.total = usage.prompt + usage.completion;
+    }
+  });
+
+  return { text: finalText, usage };
 }
 
 async function createGoogleGroundedCompletion(
@@ -527,21 +570,15 @@ async function createGoogleGroundedCompletion(
   systemPrompt,
   chatHistory,
   userText,
-  reasoningLevel,
-  googleSearchEnabled,
-  supportsThinking
+  reasoningLevel
 ) {
   const apiKey =
-    modelInfo?.genai_api_key ||
-    modelInfo?.genaiApiKey ||
-    providerInfo.genai_api_key ||
-    providerInfo.genaiApiKey ||
+    modelInfo?.api_key ||
+    modelInfo?.apiKey ||
     providerInfo.api_key ||
     providerInfo.apiKey;
 
   if (!apiKey) throw new Error("No API key for Google provider.");
-
-  const genaiModel = modelInfo?.genai_model || modelInfo?.genaiModel || modelName;
 
   const baseUrl = String(
     providerInfo.base_url ||
@@ -549,32 +586,57 @@ async function createGoogleGroundedCompletion(
     "https://generativelanguage.googleapis.com/v1beta"
   ).replace(/\/+$/, "");
 
-  const body = {
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-    contents: buildGoogleContents(chatHistory, userText),
-  };
-
-  if (googleSearchEnabled) {
-    body.tools = [{ google_search: {}, url_context: {} }];
-  }
-
-  if (supportsThinking) {
-    const thinkingLevel = getReasoningEffort(
-      providerInfo,
-      modelName,
-      reasoningLevel
-    );
-
-    if (thinkingLevel != null && thinkingLevel !== "") {
-      body.generationConfig = {
-        thinkingConfig: { thinkingLevel },
-      };
+  // 构造历史消息
+  const contents = [];
+  for (const m of chatHistory) {
+    if (m.role === "user" || m.role === "assistant") {
+      contents.push({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.raw_content || m.content }],
+      });
     }
   }
+  contents.push({ role: "user", parts: [{ text: userText }] });
 
+  const body = { contents };
+
+  // 系统提示词
+  if (systemPrompt) {
+    body.systemInstruction = { parts: [{ text: systemPrompt }] };
+  }
+
+  // 联网搜索 (Google Search)
+  const googleSearch =
+    modelInfo?.google_search ??
+    modelInfo?.googleSearch ??
+    providerInfo.google_search ??
+    providerInfo.googleSearch ??
+    false;
+
+  if (googleSearch) {
+    body.tools = [{ googleSearch: {} }];
+  }
+
+  // 思考/推理配置：开启 includeThoughts 确保思考期间持续有 SSE 流式数据输出，防止网络超时
+  const supportsThinking =
+    modelInfo?.supports_thinking ??
+    modelInfo?.supportsThinking ??
+    providerInfo.supports_thinking ??
+    providerInfo.supportsThinking ??
+    true;
+
+  body.generationConfig = body.generationConfig || {};
+
+  if (supportsThinking) {
+    body.generationConfig.thinkingConfig = {
+      includeThoughts: true,
+    };
+  }
+
+  const genaiModel = modelName.replace(/^models\//, "");
   const url = `${baseUrl}/models/${encodeURIComponent(
     genaiModel
-  )}:generateContent`;
+  )}:streamGenerateContent?alt=sse`;
 
   const resp = await fetch(url, {
     method: "POST",
@@ -585,33 +647,38 @@ async function createGoogleGroundedCompletion(
     body: JSON.stringify(body),
   });
 
-  const responseText = await resp.text();
   if (!resp.ok) {
-    throw new Error(`Google API error ${resp.status}: ${responseText}`);
+    const errorText = await resp.text();
+    throw new Error(`Google API error ${resp.status}: ${errorText}`);
   }
 
-  const data = JSON.parse(responseText);
+  let finalText = "";
+  let usage = null;
 
-  const text =
-    (data.candidates?.[0]?.content?.parts || [])
-      .map((p) => p.text || "")
-      .join("") || "";
-
-  const usageMeta = data.usageMetadata;
-
-  const promptTokens = usageMeta?.promptTokenCount || 0;
-  const completionTokens =
-    (usageMeta?.candidatesTokenCount || 0) + (usageMeta?.thoughtsTokenCount || 0);
-
-  const usage = usageMeta
-    ? {
-      prompt: promptTokens,
-      completion: completionTokens,
-      total: promptTokens + completionTokens,
+  await consumeSseStream(resp.body, (json) => {
+    const parts = json.candidates?.[0]?.content?.parts || [];
+    for (const part of parts) {
+      // 只要 SSE 收到数据（包括 thought）就能刷洗 TCP 连接保活
+      // 只将非思考过程（thought !== true）的正文追加到最终回复
+      if (part.text && !part.thought) {
+        finalText += part.text;
+      }
     }
-    : null;
 
-  return { text, usage };
+    if (json.usageMetadata) {
+      const prompt = json.usageMetadata.promptTokenCount || 0;
+      const completion =
+        (json.usageMetadata.candidatesTokenCount || 0) +
+        (json.usageMetadata.thoughtsTokenCount || 0);
+      usage = {
+        prompt,
+        completion,
+        total: json.usageMetadata.totalTokenCount || prompt + completion,
+      };
+    }
+  });
+
+  return { text: finalText, usage };
 }
 
 async function createProviderCompletion(
@@ -808,6 +875,24 @@ function renderHtml(state, providers) {
 </html>`;
 }
 
+function renderLoadingHtml(state, providers) {
+  const fullHtml = renderHtml(state, providers);
+
+  // 截取到 </body> 之前，保留文档流打开状态
+  const closeIdx = fullHtml.lastIndexOf("</body>");
+  const base = closeIdx !== -1 ? fullHtml.slice(0, closeIdx) : fullHtml;
+
+  // 在末尾追加“正在思考”加载提示
+  return (
+    base +
+    '<div id="loading" style="margin:20px auto;text-align:center;color:#999;' +
+    'font-family:sans-serif;font-size:14px;">' +
+    "正在思考中，请稍候…" +
+    "</div>"
+    // 注意：不关闭 </body></html>，等待后续流式补充
+  );
+}
+
 export default {
   async fetch(request, env, ctx) {
     try {
@@ -893,7 +978,6 @@ export default {
             "     * Incorrect: \"\\\\(因此我们可以得到 x = 2 这一结果。\\\\)\" or \"\\\\(x = 2 \\\\text{ (个)}\\\\)\"\n";
 
           const safeUserText = escapeHtml(userText).replace(/\n/g, "<br>");
-
           if (action !== "重发上次请求") {
             state.messages.push({
               role: "user",
@@ -901,50 +985,77 @@ export default {
               raw_content: userText,
             });
           }
-
-          try {
-            const [providerName, modelName] = parseModelSelection(selected);
-            const providerInfo = providers[providerName];
-
-            if (!providerInfo) {
-              throw new Error(`Provider ${providerName} not found.`);
-            }
-
-            const modelInfo = getModelConfig(providerInfo, modelName);
-
-            const apiResult = await createProviderCompletion(
-              providerName,
-              providerInfo,
-              modelInfo,
-              modelName,
-              systemPrompt,
-              chatHistory,
-              userText,
-              reasoningLevel,
-              env
-            );
-
-            const clientSupportsSvg = getCookie(request, "svg_supported") === "1";
-            const { text: textWithPlaceholders, placeholders } = processLatexToPlaceholders(
-              apiResult.text,
-              clientSupportsSvg
-            );
-            const botHtml = await marked.parse(textWithPlaceholders);
-            const botHtmlFinal = restoreLatexPlaceholders(botHtml, placeholders);
-            state.messages.push({
-              role: "assistant",
-              content: botHtmlFinal,
-              raw_content: apiResult.text,
-              usage: apiResult.usage,
-            });
-          } catch (err) {
-            const errorMessage = err.message || String(err);
-            state.messages.push({
-              role: "assistant",
-              content: `<b>ERROR:</b> ${escapeHtml(errorMessage)}`,
-              raw_content: errorMessage,
-            });
-          }
+          await saveSession(env, sessionId, state);
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream({
+            async start(controller) {
+              // 立刻发送“聊天历史 + 正在思考”的页面
+              const loadingHtml = renderLoadingHtml(state, providers);
+              controller.enqueue(encoder.encode(loadingHtml));
+              // 每 15 秒发送 keepalive，防止 Cloudflare 524 超时
+              const heartbeat = setInterval(() => {
+                try {
+                  controller.enqueue(encoder.encode("<!-- keepalive -->\n"));
+                } catch (_) {
+                  clearInterval(heartbeat);
+                }
+              }, 15000);
+              try {
+                const [providerName, modelName] = parseModelSelection(selected);
+                const providerInfo = providers[providerName];
+                if (!providerInfo) throw new Error(`Provider ${providerName} not found.`);
+                const modelInfo = getModelConfig(providerInfo, modelName);
+                const apiResult = await createProviderCompletion(
+                  providerName,
+                  providerInfo,
+                  modelInfo,
+                  modelName,
+                  systemPrompt,
+                  chatHistory,
+                  userText,
+                  reasoningLevel,
+                  env
+                );
+                const clientSupportsSvg = getCookie(request, "svg_supported") === "1";
+                const { text: textWithPlaceholders, placeholders } =
+                  processLatexToPlaceholders(apiResult.text, clientSupportsSvg);
+                const botHtml = await marked.parse(textWithPlaceholders);
+                const botHtmlFinal = restoreLatexPlaceholders(botHtml, placeholders);
+                state.messages.push({
+                  role: "assistant",
+                  content: botHtmlFinal,
+                  raw_content: apiResult.text,
+                  usage: apiResult.usage,
+                });
+                await saveSession(env, sessionId, state);
+              } catch (err) {
+                const errorMessage = err.message || String(err);
+                state.messages.push({
+                  role: "assistant",
+                  content: `<b>ERROR:</b> ${escapeHtml(errorMessage)}`,
+                  raw_content: errorMessage,
+                });
+                await saveSession(env, sessionId, state);
+              }
+              clearInterval(heartbeat);
+              // 发送 meta refresh，让浏览器刷新页面显示最终结果
+              // 同时补上 </body></html>，结束文档流
+              const ending =
+                '<meta http-equiv="refresh" content="0"></body></html>';
+              controller.enqueue(encoder.encode(ending));
+              controller.close();
+            },
+            cancel() {
+            },
+          });
+          return new Response(stream, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+              "Set-Cookie": cookieHeader,
+            },
+          });
         }
 
         await saveSession(env, sessionId, state);

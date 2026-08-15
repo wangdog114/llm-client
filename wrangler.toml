@@ -2,6 +2,9 @@ name = "llm-client"
 main = "src/index.js"
 compatibility_date = "2025-04-01"
 
+[placement]
+region = "aws:ap-northeast-3"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "ai-chat-sessions"
