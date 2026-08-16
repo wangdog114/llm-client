@@ -10,3 +10,6 @@ binding = "DB"
 database_name = "ai-chat-sessions"
 database_id = "0d6f891e-51d0-4413-bb97-79bf74eee962"
 
+[triggers]
+crons = ["0 3 * * *"]
+

@@ -12,7 +12,11 @@ export async function ensureTable(env) {
           data TEXT NOT NULL,
           expires_at INTEGER NOT NULL
         )`
-      ).run()
+      ).run().then(() =>
+        env.DB.prepare(
+          `CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions (expires_at)`
+        ).run()
+      )
     )
       .then(() => true)
       .catch((err) => {
@@ -71,5 +75,15 @@ export async function loadOrCreateSession(env, id) {
   const fresh = defaultSessionState(env);
   await saveSession(env, id, fresh);
   return fresh;
+}
+
+export async function deleteExpiredSessions(env) {
+  await ensureTable(env);
+  const result = await withRetry(() =>
+    env.DB.prepare(`DELETE FROM sessions WHERE expires_at <= ?`)
+      .bind(Date.now())
+      .run()
+  );
+  return result.meta?.changes ?? 0;
 }
 

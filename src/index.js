@@ -2,7 +2,7 @@ import { DEFAULT_SELECTION_FALLBACK, COOKIE_NAME, SYSTEM_PROMPT } from "./config
 import { escapeHtml, getProviders } from "./utils/helpers.js";
 import { getCookie, createSessionId, setSessionCookie } from "./utils/cookie.js";
 import { renderMarkdownWithLatex } from "./utils/markdown.js";
-import { loadOrCreateSession, saveSession } from "./db/session.js";
+import { loadOrCreateSession, saveSession, deleteExpiredSessions } from "./db/session.js";
 import { parseModelSelection, getModelConfig } from "./providers/utils.js";
 import { createProviderCompletion } from "./providers/index.js";
 import { renderHtml, renderLoadingHtml } from "./views/templates.js";
@@ -185,6 +185,19 @@ export default {
         status: 500,
         headers: { "Content-Type": "text/html; charset=utf-8" },
       });
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    try {
+      if (!env.DB) {
+        console.error("[cleanup] D1 binding 'DB' is not configured");
+        return;
+      }
+      const deleted = await deleteExpiredSessions(env);
+      console.log(`[cleanup] cron ${event.cron}: deleted ${deleted} expired session(s)`);
+    } catch (err) {
+      console.error(`[cleanup] failed: ${err.message || err}`);
     }
   },
 };
