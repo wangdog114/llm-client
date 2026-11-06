@@ -4,7 +4,7 @@ marked.use({ breaks: true, gfm: true });
 
 function makeLatexImg(mathCode, isSvg, type) {
   const fmt = isSvg ? "svg" : "gif";
-  const prefix = String.raw`\dpi{110}\bg_white\space `;
+  const prefix = String.raw`\dpi{110}\space `;
   const src = `https://latex.codecogs.com/${fmt}.image?${encodeURIComponent(
     prefix + mathCode
   )}`;
