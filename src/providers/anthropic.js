@@ -18,9 +18,15 @@ export async function createAnthropicCompletion(
 
   if (!apiKey) throw new Error("No API key for Anthropic provider.");
 
-  const baseUrl = String(
+  const endpoint = new URL(String(
     providerInfo.base_url || providerInfo.baseUrl || "https://api.anthropic.com"
-  ).replace(/\/+$/, "");
+  ).trim());
+  const path = endpoint.pathname.replace(/\/+$/, "");
+  endpoint.pathname = path.endsWith("/v1/messages")
+    ? path
+    : path.endsWith("/v1")
+      ? `${path}/messages`
+      : `${path}/v1/messages`;
 
   const messages = [];
   for (const m of chatHistory) {
@@ -30,11 +36,15 @@ export async function createAnthropicCompletion(
   }
   messages.push({ role: "user", content: userText });
 
-  const maxTokens =
-    modelInfo?.max_tokens ||
-    providerInfo.max_tokens ||
-    env?.ANTHROPIC_MAX_TOKENS ||
-    8000;
+  const maxTokens = Number(
+    modelInfo?.max_tokens ??
+    providerInfo.max_tokens ??
+    env?.ANTHROPIC_MAX_TOKENS ??
+    4096
+  );
+  if (!Number.isSafeInteger(maxTokens) || maxTokens <= 0) {
+    throw new Error("Anthropic max_tokens must be a positive integer.");
+  }
 
   const body = {
     model: modelName,
@@ -42,7 +52,7 @@ export async function createAnthropicCompletion(
     messages,
   };
 
-  if (systemPrompt) body.system = systemPrompt;
+  if (systemPrompt) body.system = [{ type: "text", text: systemPrompt }];
 
   const reasoningEffort = getReasoningEffort(providerInfo, modelName, reasoningLevel);
   if (reasoningEffort != null && reasoningEffort !== "") {
@@ -51,12 +61,12 @@ export async function createAnthropicCompletion(
 
   body.stream = true;
 
-  const resp = await fetch(`${baseUrl}/v1/messages`, {
+  const resp = await fetch(endpoint.toString(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
+      "anthropic-version": "2026-10-21",
     },
     body: JSON.stringify(body),
   });
@@ -66,26 +76,66 @@ export async function createAnthropicCompletion(
     throw new Error(`Anthropic API error ${resp.status}: ${errorText}`);
   }
 
+  const contentType = resp.headers.get("content-type") || "";
+  if (contentType && contentType.split(";")[0].trim().toLowerCase() !== "text/event-stream") {
+    await resp.body?.cancel();
+    throw new Error(
+      `Anthropic expected text/event-stream but received ${contentType}. Check provider type and base_url.`
+    );
+  }
+  if (!resp.body) throw new Error("Anthropic returned an empty response body.");
+
   let finalText = "";
   let usage = null;
+  let messageStopped = false;
+  let stopReason = null;
+  let tokenUsage = {};
+
+  function updateUsage(nextUsage) {
+    if (!nextUsage) return;
+    // Delta usage is cumulative and can omit fields supplied at message_start.
+    tokenUsage = { ...tokenUsage, ...nextUsage };
+    const prompt =
+      (tokenUsage.input_tokens ?? 0) +
+      (tokenUsage.cache_creation_input_tokens ?? 0) +
+      (tokenUsage.cache_read_input_tokens ?? 0);
+    const completion = tokenUsage.output_tokens ?? 0;
+    usage = { prompt, completion, total: prompt + completion };
+  }
 
   await consumeSseStream(resp.body, (json) => {
+    if (json.type === "error") {
+      throw new Error(
+        `Anthropic stream error: ${json.error?.message || json.error?.type || "Unknown error"}`
+      );
+    }
     if (json.type === "message_start") {
-      usage = {
-        prompt: json.message?.usage?.input_tokens || 0,
-        completion: 0,
-        total: 0,
-      };
+      updateUsage(json.message?.usage);
+      stopReason = json.message?.stop_reason ?? stopReason;
+    }
+    if (json.type === "content_block_start" && json.content_block?.type === "text") {
+      finalText += json.content_block.text || "";
     }
     if (json.type === "content_block_delta" && json.delta?.type === "text_delta") {
       finalText += json.delta.text || "";
     }
-    if (json.type === "message_delta" && usage) {
-      usage.completion = json.usage?.output_tokens || 0;
-      usage.total = usage.prompt + usage.completion;
+    if (json.type === "message_delta") {
+      updateUsage(json.usage);
+      stopReason = json.delta?.stop_reason ?? stopReason;
+    }
+    if (json.type === "message_stop") {
+      messageStopped = true;
     }
   });
 
+  if (!messageStopped) {
+    throw new Error("Anthropic stream ended before message_stop.");
+  }
+  if (!finalText.trim()) {
+    throw new Error(
+      `Anthropic returned no text (stop_reason: ${stopReason || "unknown"}). Check max_tokens and the upstream response.`
+    );
+  }
+
   return { text: finalText, usage };
 }
-

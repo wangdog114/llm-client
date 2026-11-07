@@ -16,39 +16,25 @@ export async function createProviderCompletion(
 ) {
   const type = getProviderType(providerName, providerInfo);
 
-  if (type === "anthropic") {
-    return createAnthropicCompletion(
-      providerInfo,
-      modelInfo,
-      modelName,
-      systemPrompt,
-      chatHistory,
-      userText,
-      reasoningLevel,
-      env
-    );
-  }
-
-  if (type === "google") {
-    return createGoogleGroundedCompletion(
-      providerInfo,
-      modelInfo,
-      modelName,
-      systemPrompt,
-      chatHistory,
-      userText,
-      reasoningLevel
-    );
-  }
-
-  return createOpenAICompletion(
+  const createCompletion = {
+    anthropic: createAnthropicCompletion,
+    google: createGoogleGroundedCompletion,
+    openai: createOpenAICompletion,
+  }[type];
+  const result = await createCompletion(
     providerInfo,
     modelInfo,
     modelName,
     systemPrompt,
     chatHistory,
     userText,
-    reasoningLevel
+    reasoningLevel,
+    env
   );
+  if (typeof result.text !== "string" || !result.text.trim()) {
+    throw new Error(
+      `Provider ${providerName} returned an empty text response. Check provider type, base_url and model configuration.`
+    );
+  }
+  return result;
 }
-
